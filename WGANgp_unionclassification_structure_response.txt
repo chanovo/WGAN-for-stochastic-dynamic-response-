@@ -1,0 +1,251 @@
+# -*- coding: utf-8 -*-
+""" regard [E, Velocity] as a random vector, and use WGANgp to generate it from noise without labels"""
+""" author: chan_ovo """
+# ===========================================================================================================  
+
+import xlrd
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+
+# ******************************************define the input reading function********************************
+
+def get_inputs_from_xlsxfile(file_name, normalization = True):
+    sh = xlrd.open_workbook(file_name).sheet_by_name('Sheet1') # watch your capitalization carefully        
+    num_rows = sh.nrows
+    num_cols = sh.ncols
+    array = np.zeros((num_rows, num_cols))
+    for i in range(num_rows):
+        for j in range(num_cols):
+            array[i][j] = sh.cell_value(i,j)
+    upbound = np.max(array)
+    lowbound = np.min(array)
+    # normalize the samples to the interval[-1,1]
+    if normalization == True:
+        array = (array-lowbound)/(upbound-lowbound)*2-1
+    return array, lowbound, upbound
+
+# ******************************************define the input interface***************************************
+
+def get_inputs(dim_records, dim_noise, dim_label): 
+    real_records = tf.placeholder(tf.float32, [None, dim_records], name = 'real_records') # None is samples number
+    noise_samples = tf.placeholder(tf.float32, [None, dim_noise], name = 'noise_samples')
+    label = tf.placeholder(tf.float32, [None, dim_label], name = 'label')
+    return real_records, noise_samples, label
+
+# ********************************************define the generator*******************************************
+
+def get_generator(noise_samples, label, dim_records, reuse = False, alpha = 0.01):
+    # noise_samples(tensor(a, b)): noise sample set importing to the generator
+    # label(tensor(a,c)): classified labels
+    # dim_records(int): output of the generator
+    # reuse(bool): tf.variable_scope parm. which decides whether to share the parm. in generator
+    # alpha(float): parm. of the ReLU activation function
+
+    num_units_h1_noise = 500
+    num_units_h1_label = 0
+    num_units_h2 = 1000
+    num_units_h3 = dim_records
+    drop_rate = 0
+
+    with tf.variable_scope('generator', reuse = reuse):
+        # hidden layer1(leaky ReLU):  
+        hidden1_noise = tf.layers.dense(noise_samples, num_units_h1_noise)
+        hidden1_noise = tf.maximum(alpha*hidden1_noise, hidden1_noise)
+        hidden1_noise = tf.layers.dropout(hidden1_noise, rate = drop_rate)
+
+        hidden1_label = tf.layers.dense(label, num_units_h1_label)
+        hidden1_label = tf.maximum(alpha*hidden1_label, hidden1_label)
+        hidden1_label = tf.layers.dropout(hidden1_label, rate = drop_rate)
+        
+        hidden1 = tf.concat([hidden1_noise, hidden1_label], 1)
+
+        # hidden layer2(leaky ReLU):
+        hidden2 = tf.layers.dense(hidden1, num_units_h2)
+        tf.maximum(alpha*hidden2, hidden2)
+        hidden2 = tf.layers.dropout(hidden2, rate = drop_rate)
+
+        # hidden layer3(logits & outputs):
+        gen_logits = tf.layers.dense(hidden2, num_units_h3)
+        gen_records = tf.tanh(gen_logits)
+    
+    return gen_logits, gen_records
+
+# ********************************************define the discriminator***************************************
+
+def get_discriminator(records, label, reuse = False, alpha = 0.01):
+    # records(tensor(a, b)): input of the discriminator 
+    # label(tensor(a, c)): classified labels
+    # reuse(bool): tf.variable_scope parm. which decides whether to share the parm. in generator 
+    # alpha: Leaky ReLU coefficient
+
+    num_units_h1_records = 1000
+    num_units_h1_label = 0
+    num_units_h2 = 500
+    num_units_h3 =  100
+    drop_rate = 0
+
+    with tf.variable_scope('discriminator', reuse = reuse):
+        # hiden layer1(leaky ReLU):
+        hidden1_records = tf.layers.dense(records, num_units_h1_records)
+        hidden1_records = tf.maximum(alpha*hidden1_records, hidden1_records)
+        hidden1_records = tf.layers.dropout(hidden1_records, rate = drop_rate)
+
+        hidden1_label = tf.layers.dense(label, num_units_h1_label)
+        hidden1_label = tf.maximum(alpha*hidden1_label, hidden1_label)
+        hidden1_label = tf.layers.dropout(hidden1_label, rate = drop_rate)
+        
+        hidden1 = tf.concat([hidden1_records, hidden1_label], 1)
+        
+        # hidden layer2(leaky ReLU):
+        hidden2 = tf.layers.dense(hidden1, num_units_h2)
+        tf.maximum(alpha*hidden2, hidden2)
+        hidden2 = tf.layers.dropout(hidden2, rate = drop_rate)
+        
+        # hidden layer3(leaky ReLU):
+        hidden3 = tf.layers.dense(hidden2, num_units_h3)
+        tf.maximum(alpha*hidden3, hidden3)
+        hidden3 = tf.layers.dropout(hidden3, rate = drop_rate)
+
+        # output:
+        output = tf.layers.dense(hidden3, 1)
+    return output
+
+# ********************************read normalized inputs from the .xlsx files********************************
+
+# E_sample: ndarray, (200, 10), noise 
+# Velocity: ndarray (200+1, 2675) 
+# Velocity[0:200]: training records
+# Assigned_Prob: ndarray (200, 1), Assigned_Probability
+   
+Assigned_Pro, _, _ =  get_inputs_from_xlsxfile('E:/graduateThirdFall/20190111/examples/results/Assigned_Pro.xlsx', normalization = False)
+E_sample_init, lbound_E_sample, ubound_E_sample = get_inputs_from_xlsxfile('examples/results/E_sample.xlsx')
+Velocity_init, lbound_Velocity, ubound_Velocity = get_inputs_from_xlsxfile('examples/results/Velocity.xlsx')
+bound = [lbound_E_sample, ubound_E_sample, lbound_Velocity, ubound_Velocity]
+print('lbound_Velocity:', lbound_Velocity, 'ubound_Velocity:', ubound_Velocity, 'lbound_E_sample:', lbound_E_sample, 'ubound_E_sample:', ubound_E_sample)
+
+# expansion training set refering to Assigned_Prob, batch_size =50
+""" num_records = 0
+E_sample = np.array([])
+Velocity = np.array([])
+for i in range(len(Assigned_Pro)):
+    num_rep = (Assigned_Pro[i, 0]//np.min(Assigned_Pro)).astype(np.int32)
+    for j in range(num_rep):
+        E_sample = np.append(E_sample, E_sample_init[i, :])
+        Velocity = np.append(Velocity, Velocity_init[i, :])
+    num_records = num_records+num_rep
+
+E_sample = np.reshape(E_sample, [num_records, -1])
+Velocity = np.reshape(Velocity, [num_records, -1]) """
+
+# ordinary training set, batch_size = 20
+Velocity = Velocity_init[0: -1]
+E_sample = E_sample_init
+num_records = len(Velocity)
+
+
+Velocity = np.concatenate((E_sample, Velocity), 1)
+
+# ********************************************construct the graph********************************************
+
+# definition of the parameters
+
+# dt: time interval of Velocity records 
+# num_records: number of training records  
+# dim_records: dimension of training records 
+# dim_label: dimension of labels
+
+dt = 0.02
+dim_noise = 100
+dim_label = len(E_sample[0])  
+dim_records = len(Velocity[0])
+print('dim_label:', dim_label, 'num_records:', num_records, 'dim_records:', dim_records)
+
+# generator and discriminator construction
+tf.reset_default_graph() 
+real_records, noise_samples, label = get_inputs(dim_records, dim_noise, dim_label)
+_, gen_records = get_generator(noise_samples, label, dim_records)
+
+d_logits_real = get_discriminator(real_records, label) 
+d_logits_gen = get_discriminator(gen_records, label, reuse = True)
+# print(np.shape(d_logits_gen))
+
+# loss computation
+# lamda: gradient penalty coefficient used in WGAN-gp
+d_loss_original = tf.reduce_mean(d_logits_gen)-tf.reduce_mean(d_logits_real)
+lamda = 10
+alpha = tf.random_uniform(shape = tf.shape(d_logits_gen), minval = 0., maxval = 1.) # shape(?, 1)
+interpolates = real_records + (alpha * (gen_records - real_records))
+gradients = tf.gradients(get_discriminator(interpolates, label, reuse = True), interpolates)[0] # shape(?, dim_records)
+slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices = 1)) # shape
+gradient_penalty = tf.reduce_mean((slopes - 1.) ** 2)  # to get the mean value
+d_loss = d_loss_original+lamda*gradient_penalty
+
+g_loss = -tf.reduce_mean(d_logits_gen)
+
+# optimizer
+train_vars = tf.trainable_variables() # tran_vars is a list
+g_vars = [var for var in train_vars if var.name.startswith('generator')] # g_vars is a list 
+d_vars = [var for var in train_vars if var.name.startswith('discriminator')]
+
+
+d_train_opt = tf.train.AdamOptimizer(learning_rate = 1e-3, beta1 = 0.5, beta2 = 0.999).minimize(d_loss, var_list = d_vars)
+g_train_opt = tf.train.AdamOptimizer(learning_rate = 1e-3, beta1 = 0.5, beta2 = 0.999).minimize(g_loss, var_list = g_vars)
+
+# *********************************************training process*******************************************
+
+# training and saving parameters
+batch_size = 20
+epochs = 1000 # training iterations
+n_sample = 5
+i_d = 100 # training k_d times of discriminator for every k_g generator training
+i_g = 1 
+
+samples = []
+losses = []
+update_interval = 5 # update the losses and samples every interval epochs
+saver = tf.train.Saver(var_list = g_vars)
+
+# session
+with tf.Session() as sess:
+    sess.run(tf.global_variables_initializer())
+    
+    for e in range(epochs):
+        
+        combination = np.concatenate((E_sample, Velocity), 1)
+        np.random.shuffle(combination)
+        # print(np.shape(combination))
+
+        for batch_i in range(num_records//batch_size):
+                       
+            batch_records = combination[(batch_i*batch_size):((batch_i+1)*batch_size), dim_label:]
+            label_batch_i = combination[(batch_i*batch_size):((batch_i+1)*batch_size), 0:dim_label]
+            # print(label_batch_i.shape, batch_records.shape)
+
+            for k in range(i_d):
+                batch_noise = np.random.uniform(-1, 1, size = (batch_size, dim_noise))
+                sess.run(d_train_opt, feed_dict = {real_records: batch_records, noise_samples: batch_noise, label: label_batch_i})
+            
+            for k in range(i_g):
+                batch_noise = np.random.uniform(-1, 1, size = (batch_size, dim_noise))
+                sess.run(g_train_opt, feed_dict = {noise_samples: batch_noise, label: label_batch_i})
+
+        batch_noise = np.random.uniform(-1, 1, size = (num_records, dim_noise))
+        batch_records = combination[:, dim_label:]
+        label_Total = combination[:, 0:dim_label]
+        train_loss_d = sess.run(d_loss_original, feed_dict = {real_records: batch_records, noise_samples: batch_noise, label: label_Total})
+        train_loss_g = sess.run(g_loss, feed_dict = {noise_samples: batch_noise, label: label_Total})
+
+        print('Epoch: %d/%d ...'%(e+1, epochs), 'Discriminator Loss:', str(train_loss_d), '...', 'Generator Loss:', str(train_loss_g))
+
+        if e%update_interval==0:
+            losses.append([train_loss_d, train_loss_g])
+
+            sample_noise = np.random.uniform(-1, 1, size = (n_sample, dim_noise))
+            label_samples =  combination[0:n_sample, 0:dim_label]
+            _, gen_samples = sess.run(get_generator(noise_samples, label, dim_records, reuse = True), feed_dict = {noise_samples: sample_noise, label: label_samples})
+            samples.append(gen_samples)
+# storage     
+    saver.save(sess, './model_unionclassification_WGANgp/generator.ckpt')    
+np.savez('./model_unionclassification_WGANgp/Samples.npz', samples, losses)
